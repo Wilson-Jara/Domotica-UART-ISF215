@@ -10,9 +10,20 @@
 // ============================================================================
 
 
-// ============================================================================
-// [WILSON] Enum MensajeID con los IDs del protocolo
-// ============================================================================
+// Enum con los IDs del protocolo UART.
+// Define los codigos de comando, alertas y confirmaciones
+// que se intercambian entre el Arduino y el backend Python.
+enum MensajeID : uint8_t {
+  MSG_ALERTA_INTRUSO = 0x01,
+  MSG_ABRIR_PUERTA   = 0x02,
+  MSG_CERRAR_PUERTA  = 0x03,
+  MSG_ABRIR_VENTANA  = 0x04,
+  MSG_CERRAR_VENTANA = 0x05,
+  MSG_ESTADO         = 0x06,
+  MSG_ACK            = 0x07,
+  MSG_ERROR          = 0x08
+};
+
 const uint32_t SERIAL_BAUD = 9600;
 const uint32_t TIMEOUT_UART_MS = 50;
 const uint32_t REFRESH_SENSOR_MS = 250;
@@ -28,9 +39,16 @@ Servo servoVentana;
 // ============================================================================
 
 
-// ============================================================================
-// [WILSON] Enum RX_Estado y variables de la FSM receptora UART
-// ============================================================================
+// FSM de recepcion UART con sus variables de estado.
+// Estado actual de la maquina, buffer para armar la trama entrante
+// y temporizador para detectar timeout en la recepcion.
+enum RX_Estado { WAIT_SOF, WAIT_ID, WAIT_LEN, WAIT_DATA, WAIT_CHK };
+RX_Estado estadoActualRX = WAIT_SOF;
+
+uint8_t rxId = 0, rxLen = 0, rxChk = 0, rxIndexData = 0;
+uint8_t rxBufferData[64];
+uint32_t tUltimoByteRx = 0;
+uint32_t tiempoInicioProcesamiento = 0;
 
 
 // ============================================================================
@@ -52,18 +70,65 @@ void loop() {
   // TODO(Vicente Saa)
 }
 
-// ============================================================================
-// [WILSON] serialEvent(): FSM de recepción byte a byte
-// ============================================================================
+// Lee byte a byte del puerto serial y arma la trama entrante.
+// Avanza por los estados SOF -> ID -> LEN -> DATA -> CHK.
+// Al completar la trama llama a validarYProcesarTrama().
 void serialEvent() {
-  // TODO(Wilson)
+  while (Serial.available() > 0) {
+    uint8_t byteRecibido = Serial.read();
+    tUltimoByteRx = millis();
+
+    switch (estadoActualRX) {
+      case WAIT_SOF:
+        if (byteRecibido == SOF_BYTE) {
+          tiempoInicioProcesamiento = micros();
+          estadoActualRX = WAIT_ID;
+        }
+        break;
+      case WAIT_ID:
+        rxId = byteRecibido;
+        estadoActualRX = WAIT_LEN;
+        break;
+      case WAIT_LEN:
+        rxLen = byteRecibido;
+        rxIndexData = 0;
+        estadoActualRX = (rxLen == 0) ? WAIT_CHK : WAIT_DATA;
+        break;
+      case WAIT_DATA:
+        rxBufferData[rxIndexData++] = byteRecibido;
+        if (rxIndexData >= rxLen) estadoActualRX = WAIT_CHK;
+        break;
+      case WAIT_CHK:
+        rxChk = byteRecibido;
+        validarYProcesarTrama();
+        break;
+    }
+  }
 }
 
-// ============================================================================
-// [WILSON] validarYProcesarTrama(): verificar checksum y despachar comandos
-// ============================================================================
+// Calcula el checksum XOR de la trama y lo compara con el recibido.
+// Si es valido, despacha el comando: abre/cierra puerta o ventana,
+// o envia el estado actual. Responde con ACK o ERROR segun corresponda.
 void validarYProcesarTrama() {
-  // TODO(Wilson)
+  uint8_t checksumCalculado = rxId ^ rxLen;
+  for (uint8_t i = 0; i < rxLen; i++) checksumCalculado ^= rxBufferData[i];
+
+  if (checksumCalculado != rxChk) {
+    uint8_t codigoErrorChecksum = 0xE1;
+    enviarTrama(MSG_ERROR, &codigoErrorChecksum, 1);
+    estadoActualRX = WAIT_SOF;
+    return;
+  }
+
+  switch (rxId) {
+    case MSG_ABRIR_PUERTA:   puertaAbierta = true;   enviarACK(MSG_ABRIR_PUERTA); break;
+    case MSG_CERRAR_PUERTA:  puertaAbierta = false;  enviarACK(MSG_CERRAR_PUERTA); break;
+    case MSG_ABRIR_VENTANA:  ventanaAbierta = true;  enviarACK(MSG_ABRIR_VENTANA); break;
+    case MSG_CERRAR_VENTANA: ventanaAbierta = false; enviarACK(MSG_CERRAR_VENTANA); break;
+    case MSG_ESTADO:         enviarEstado(); break;
+  }
+  actualizarActuadores();
+  estadoActualRX = WAIT_SOF;
 }
 
 // ============================================================================
@@ -80,23 +145,39 @@ void actualizarActuadores() {
   // TODO(Sarai)
 }
 
-// ============================================================================
-// [WILSON] enviarTrama(): construir y enviar trama [SOF][ID][LEN][DATA][CHK]
-// ============================================================================
+// Construye una trama binaria con formato [SOF | ID | LEN | DATA | CHK]
+// y la envia por el puerto serial. El checksum se calcula con XOR
+// entre el ID, la longitud y todos los bytes del payload.
 void enviarTrama(uint8_t id, uint8_t* data, uint8_t len) {
-  // TODO(Wilson)
+  uint8_t chk = id ^ len;
+  Serial.write(SOF_BYTE);
+  Serial.write(id);
+  Serial.write(len);
+  for (uint8_t i = 0; i < len; i++) {
+    Serial.write(data[i]);
+    chk ^= data[i];
+  }
+  Serial.write(chk);
 }
 
-// ============================================================================
-// [WILSON] enviarACK(): confirmación con tiempo de procesamiento del MCU
-// ============================================================================
+// Envia una trama de confirmacion (ACK) al backend Python.
+// Incluye el ID del comando confirmado y el tiempo que tardo
+// el microcontrolador en procesarlo, medido en microsegundos.
 void enviarACK(uint8_t idConfirmado) {
-  // TODO(Wilson)
+  uint32_t tiempoEjecucion = micros() - tiempoInicioProcesamiento;
+  uint8_t payload[5];
+  payload[0] = idConfirmado;
+  memcpy(&payload[1], &tiempoEjecucion, 4);
+  enviarTrama(MSG_ACK, payload, 5);
 }
 
-// ============================================================================
-// [WILSON] enviarEstado(): reportar puerta/ventana/alarma al backend
-// ============================================================================
+// Envia al backend el estado actual del sistema en 3 bytes:
+// puerta (abierta/cerrada), ventana (abierta/cerrada) y alarma (activa/inactiva).
+// Se usa tanto para consultas periodicas como respuesta al comando MSG_ESTADO.
 void enviarEstado() {
-  // TODO(Wilson)
+  uint8_t payload[3];
+  payload[0] = puertaAbierta ? 0x01 : 0x00;
+  payload[1] = ventanaAbierta ? 0x01 : 0x00;
+  payload[2] = alarmaActiva ? 0x01 : 0x00;
+  enviarTrama(MSG_ESTADO, payload, 3);
 }
